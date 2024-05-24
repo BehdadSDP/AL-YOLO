@@ -514,7 +514,7 @@ def parse_opt(known=False):
     """Parses command-line arguments for YOLOv5 training, validation, and testing."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="yolov5s.yaml", help="model.yaml path")
+    parser.add_argument("--cfg", type=str, default="better_yolo.yaml", help="model.yaml path")
     parser.add_argument("--data", type=str, default=ROOT / "data/fogging.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=1, help="total training epochs")
