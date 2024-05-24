@@ -767,14 +767,14 @@ class LoadImagesAndLabels(Dataset):
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        if mosaic:
+        if self.mosaic:
             # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
 
-            # MixUp augmentation
-            if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+            # # MixUp augmentation
+            # if random.random() < hyp["mixup"]:
+            #     img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
 
         else:
             # Load image
@@ -829,15 +829,15 @@ class LoadImagesAndLabels(Dataset):
             # nl = len(labels)  # update after cutout
 
         #save augmented images
-        if self.augment:
-            aug_path = self.im_files[index].replace("datasets_1", "augmented_images")
-            aug_l_path = self.label_files[index].replace("datasets_1", "augmented_images")
-            cv2.imwrite(aug_path, img)
-            with open(aug_l_path, "w") as f:
-                for i, row in enumerate(labels):
-                    for j in range(5):
-                        f.write(str(row[j]) + " ")
-                    f.write("\n")
+        # if self.augment:
+        #     aug_path = self.im_files[index].replace("datasets_1", "augmented_images")
+        #     aug_l_path = self.label_files[index].replace("datasets_1", "augmented_images")
+        #     cv2.imwrite(aug_path, img)
+        #     with open(aug_l_path, "w") as f:
+        #         for i, row in enumerate(labels):
+        #             for j in range(5):
+        #                 f.write(str(row[j]) + " ")
+        #             f.write("\n")
 
         labels_out = torch.zeros((nl, 6))
         if nl:

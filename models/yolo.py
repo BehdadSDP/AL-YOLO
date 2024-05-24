@@ -25,31 +25,7 @@ if str(ROOT) not in sys.path:
 if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import (
-    C3,
-    C3SPP,
-    C3TR,
-    SPP,
-    SPPF,
-    Bottleneck,
-    BottleneckCSP,
-    C3Ghost,
-    C3x,
-    Classify,
-    Concat,
-    Contract,
-    Conv,
-    CrossConv,
-    DetectMultiBackend,
-    DWConv,
-    DWConvTranspose2d,
-    Expand,
-    Focus,
-    GhostBottleneck,
-    GhostConv,
-    CA_Block,
-    Proto,
-)
+from models.common import *
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, colorstr, make_divisible, print_args
@@ -150,7 +126,6 @@ class Segment(Detect):
 
 class BaseModel(nn.Module):
     """YOLOv5 base model."""
-
     def forward(self, x, profile=False, visualize=False):
         """Executes a single-scale inference or training pass on the YOLOv5 base model, with options for profiling and
         visualization.
@@ -412,7 +387,11 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
-            CA_Block
+            DTFR,
+            MobileViTBlockv2,
+            CA_Block,
+            InvertedResidual,
+            C3RFEM
         }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output

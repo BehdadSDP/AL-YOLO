@@ -12,6 +12,7 @@ from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
 from urllib.parse import urlparse
+from typing import Union, Optional, Tuple, Dict
 
 import cv2
 import numpy as np
@@ -19,8 +20,18 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from PIL import Image
 from torch.cuda import amp
+from torch import Tensor
+import math
+from typing import Optional, Dict, Tuple, Union, Sequence
+
+from torch import Tensor
+import math
+from typing import Optional, Dict, Tuple, Union, Sequence
+from models.linear_attention import LinearAttnFFN
+from models.BaseLayers import LayerNorm
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -56,6 +67,7 @@ from utils.general import (
 )
 from utils.torch_utils import copy_attr, smart_inference_mode
 
+from utils.deform_conv_v2 import DeformConv2D
 
 def autopad(k, p=None, d=1):
     """
@@ -1080,11 +1092,221 @@ class Classify(nn.Module):
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
 
 #added modules
+
+class DTFR(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.de_conv1 = DeformConv2D(inc=in_channels, outc=out_channels, kernel_size=kernel_size, padding=1, stride=1, modulation=True)
+        self.de_conv2 = DeformConv2D(inc=in_channels, outc=out_channels, kernel_size=kernel_size, padding=1, stride=1, modulation=True)
+        self.transformer = C3TR(out_channels, out_channels)
+    def forward(self, x):
+        return self.transformer((self.de_conv2(self.de_conv1(x))))
+ 
+"""mobile vision transformer version 3"""
+class MobileViTBlockv2(nn.Module):
+    """
+    This class defines the `MobileViTv2 <https://arxiv.org/abs/2206.02680>`_ block
+
+    Args:
+        in_channels (int): :math:`C_{in}` from an expected input of size :math:`(N, C_{in}, H, W)`
+        attn_unit_dim (int): Input dimension to the attention unit
+        ffn_multiplier (int): Expand the input dimensions by this factor in FFN. Default is 2.
+        n_attn_blocks (Optional[int]): Number of attention units. Default: 2
+        attn_dropout (Optional[float]): Dropout in multi-head attention. Default: 0.0
+        dropout (Optional[float]): Dropout rate. Default: 0.0
+        ffn_dropout (Optional[float]): Dropout between FFN layers in transformer. Default: 0.0
+        patch_h (Optional[int]): Patch height for unfolding operation. Default: 8
+        patch_w (Optional[int]): Patch width for unfolding operation. Default: 8
+        conv_ksize (Optional[int]): Kernel size to learn local representations in MobileViT block. Default: 3
+        dilation (Optional[int]): Dilation rate in convolutions. Default: 1
+        attn_norm_layer (Optional[str]): Normalization layer in the attention block. Default: layer_norm_2d
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        attn_unit_dim: int,
+        ffn_multiplier: Optional[Union[Sequence[Union[int, float]], int, float]] = 2.0,
+        n_attn_blocks: Optional[int] = 2,
+        attn_dropout: Optional[float] = 0.0,
+        dropout: Optional[float] = 0.0,
+        ffn_dropout: Optional[float] = 0.0,
+        patch_h: Optional[int] = 8,
+        patch_w: Optional[int] = 8,
+        conv_ksize: Optional[int] = 3,
+        dilation: Optional[int] = 1,
+        *args,
+        **kwargs
+    ) -> None:
+        cnn_out_dim = attn_unit_dim
+
+        conv_3x3_in = nn.Sequential(nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=conv_ksize,
+            stride=1,
+            dilation=dilation,
+            groups=in_channels,
+            padding=1,
+        ),
+        nn.BatchNorm2d(num_features=in_channels),
+        nn.LeakyReLU(negative_slope=0.1))
+
+        conv_1x1_in = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=cnn_out_dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+        )
+
+        super(MobileViTBlockv2, self).__init__()
+        self.local_rep = nn.Sequential(conv_3x3_in, conv_1x1_in)
+
+        self.global_rep, attn_unit_dim = self._build_attn_layer(
+            d_model=attn_unit_dim,
+            ffn_mult=ffn_multiplier,
+            n_layers=n_attn_blocks,
+            attn_dropout=attn_dropout,
+            dropout=dropout,
+            ffn_dropout=ffn_dropout,
+        )
+
+        self.conv_proj = nn.Sequential(nn.Conv2d(
+            in_channels=cnn_out_dim,
+            out_channels=in_channels,
+            kernel_size=1,
+            stride=1,
+        ),
+        nn.BatchNorm2d(num_features=in_channels))
+
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.patch_area = self.patch_w * self.patch_h
+
+        self.cnn_in_dim = in_channels
+        self.cnn_out_dim = cnn_out_dim
+        self.transformer_in_dim = attn_unit_dim
+        self.dropout = dropout
+        self.attn_dropout = attn_dropout
+        self.ffn_dropout = ffn_dropout
+        self.n_blocks = n_attn_blocks
+        self.conv_ksize = conv_ksize
+
+    def _build_attn_layer(
+        self,
+        d_model: int,
+        ffn_mult: Union[Sequence, int, float],
+        n_layers: int,
+        attn_dropout: float,
+        dropout: float,
+        ffn_dropout: float,
+        *args,
+        **kwargs
+    ) -> Tuple[nn.Module, int]:
+
+        if isinstance(ffn_mult, Sequence) and len(ffn_mult) == 2:
+            ffn_dims = (
+                np.linspace(ffn_mult[0], ffn_mult[1], n_layers, dtype=float) * d_model
+            )
+        elif isinstance(ffn_mult, Sequence) and len(ffn_mult) == 1:
+            ffn_dims = [ffn_mult[0] * d_model] * n_layers
+        elif isinstance(ffn_mult, (int, float)):
+            ffn_dims = [ffn_mult * d_model] * n_layers
+        else:
+            raise NotImplementedError
+
+        # ensure that dims are multiple of 16
+        ffn_dims = [int((d // 16) * 16) for d in ffn_dims]
+
+        global_rep = [
+            LinearAttnFFN(
+                embed_dim=d_model,
+                ffn_latent_dim=ffn_dims[block_idx],
+                attn_dropout=attn_dropout,
+                dropout=dropout,
+                ffn_dropout=ffn_dropout,
+            )
+            for block_idx in range(n_layers)
+        ]
+        global_rep.append(
+            LayerNorm(normalized_shape=d_model)
+        )
+
+        return nn.Sequential(*global_rep), d_model
+
+
+    def unfolding_pytorch(self, feature_map: Tensor) -> Tuple[Tensor, Tuple[int, int]]:
+
+        batch_size, in_channels, img_h, img_w = feature_map.shape
+
+        # [B, C, H, W] --> [B, C, P, N]
+        patches = F.unfold(
+            feature_map,
+            kernel_size=(self.patch_h, self.patch_w),
+            stride=(self.patch_h, self.patch_w),
+        )
+        patches = patches.reshape(
+            batch_size, in_channels, self.patch_h * self.patch_w, -1
+        )
+
+        return patches, (img_h, img_w)
+
+    def folding_pytorch(self, patches: Tensor, output_size: Tuple[int, int]) -> Tensor:
+        batch_size, in_dim, patch_size, n_patches = patches.shape
+
+        # [B, C, P, N]
+        patches = patches.reshape(batch_size, in_dim * patch_size, n_patches)
+
+        feature_map = F.fold(
+            patches,
+            output_size=output_size,
+            kernel_size=(self.patch_h, self.patch_w),
+            stride=(self.patch_h, self.patch_w),
+        )
+
+        return feature_map
+
+
+    # def resize_input_if_needed(self, x):
+    #     batch_size, in_channels, orig_h, orig_w = x.shape
+    #     if orig_h % self.patch_h != 0 or orig_w % self.patch_w != 0:
+    #         new_h = int(math.ceil(orig_h / self.patch_h) * self.patch_h)
+    #         new_w = int(math.ceil(orig_w / self.patch_w) * self.patch_w)
+    #         x = F.interpolate(
+    #             x, size=(new_h, new_w), mode="bilinear", align_corners=True
+    #         )
+    #     return x
+
+    def forward_spatial(self, x: Tensor, *args, **kwargs) -> Tensor:
+        # x = self.resize_input_if_needed(x)
+
+        fm = self.local_rep(x)
+
+        # convert feature map to patches
+        patches, output_size = self.unfolding_pytorch(fm)
+
+        # learn global representations on all patches
+        patches = self.global_rep(patches)
+
+        # [B x Patch x Patches x C] --> [B x C x Patches x Patch]
+        fm = self.folding_pytorch(patches=patches, output_size=output_size)
+        fm = self.conv_proj(fm)
+
+        return fm
+
+
+    def forward(
+        self, x: Union[Tensor, Tuple[Tensor]], *args, **kwargs
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        return self.forward_spatial(x)
+    
 class CA_Block(nn.Module):
-    def __init__(self, channel, reduction=16):
+    def __init__(self, input_channel, channel, reduction=16):
         super(CA_Block, self).__init__()
 
-        self.conv_1x1 = nn.Conv2d(in_channels=channel, out_channels=channel // reduction, kernel_size=1, stride=1,
+        self.conv_1x1 = nn.Conv2d(in_channels=input_channel, out_channels=channel // reduction, kernel_size=1, stride=1,
                                   bias=False)
 
         self.relu = nn.ReLU()
@@ -1113,3 +1335,265 @@ class CA_Block(nn.Module):
 
         out = x * s_h.expand_as(x) * s_w.expand_as(x)
         return out
+    
+def make_divisible(
+    v: Union[float, int],
+    divisor: Optional[int] = 8,
+    min_value: Optional[Union[float, int]] = None,
+) -> Union[float, int]:
+    """
+    This function is taken from the original tf repo.
+    It ensures that all layers have a channel number that is divisible by 8
+    It can be seen here:
+    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    :param v:
+    :param divisor:
+    :param min_value:
+    :return:
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+class InvertedResidual(nn.Module):
+    """
+    This class implements the inverted residual block, as described in `MobileNetv2 <https://arxiv.org/abs/1801.04381>`_ paper
+
+    Args:
+        opts: command-line arguments
+        in_channels (int): :math:`C_{in}` from an expected input of size :math:`(N, C_{in}, H_{in}, W_{in})`
+        out_channels (int): :math:`C_{out}` from an expected output of size :math:`(N, C_{out}, H_{out}, W_{out)`
+        stride (Optional[int]): Use convolutions with a stride. Default: 1
+        expand_ratio (Union[int, float]): Expand the input channels by this factor in depth-wise conv
+        dilation (Optional[int]): Use conv with dilation. Default: 1
+        skip_connection (Optional[bool]): Use skip-connection. Default: True
+
+    Shape:
+        - Input: :math:`(N, C_{in}, H_{in}, W_{in})`
+        - Output: :math:`(N, C_{out}, H_{out}, W_{out})`
+
+    .. note::
+        If `in_channels =! out_channels` and `stride > 1`, we set `skip_connection=False`
+
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        expand_ratio: Union[int, float],
+        dilation: int = 1,
+        skip_connection: Optional[bool] = True,
+        *args,
+        **kwargs
+    ) -> None:
+        assert stride in [1, 2]
+        hidden_dim = make_divisible(int(round(in_channels * expand_ratio)), 8)
+
+        super().__init__()
+
+        block = nn.Sequential()
+        if expand_ratio != 1:
+            block.add_module(
+                name="exp_1x1",
+                module=nn.Conv2d(
+                    in_channels=in_channels,
+                    out_channels=hidden_dim,
+                    kernel_size=1,
+                    padding=0,
+                ),
+
+            )
+
+            block.add_module(
+                name="exp_1x1_bn",
+                module=nn.BatchNorm2d(num_features=hidden_dim),
+            )
+
+            block.add_module(
+                name="exp_1x1_act",
+                module=nn.LeakyReLU(negative_slope=0.1),
+            )
+
+
+        block.add_module(
+            name="conv_3x3",
+            module=nn.Conv2d(
+                in_channels=hidden_dim,
+                out_channels=hidden_dim,
+                stride=stride,
+                kernel_size=3,
+                groups=hidden_dim,
+                dilation=dilation,
+                padding=1,
+            ),
+        )
+        block.add_module(
+            name="conv_3x3_bn",
+            module=nn.BatchNorm2d(num_features=hidden_dim),
+        )
+        block.add_module(
+            name="conv_3x3_act",
+            module=nn.LeakyReLU(negative_slope=0.1),
+        )
+
+
+        block.add_module(
+            name="red_1x1",
+            module=nn.Conv2d(
+                in_channels=hidden_dim,
+                out_channels=out_channels,
+                kernel_size=1,
+                padding=0,
+            ),
+        )
+        block.add_module(
+            name="red_1x1_bn",
+            module=nn.BatchNorm2d(num_features=out_channels),
+        )
+
+        self.block = block
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.exp = expand_ratio
+        self.dilation = dilation
+        self.stride = stride
+        self.use_res_connect = (
+            self.stride == 1 and in_channels == out_channels and skip_connection
+        )
+
+    def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
+        if self.use_res_connect:
+            return x + self.block(x)
+        else:
+            return self.block(x)
+        
+class TridentBlock(nn.Module):
+    def __init__(self, c1, c2, stride=1, c=False, e=0.5, padding=[1, 2, 3], dilate=[1, 2, 3], bias=False):
+        super(TridentBlock, self).__init__()
+        self.stride = stride
+        self.c = c
+        c_ = int(c2 * e)
+        self.padding = padding
+        self.dilate = dilate
+        self.share_weightconv1 = nn.Parameter(torch.Tensor(c_, c1, 1, 1))
+        self.share_weightconv2 = nn.Parameter(torch.Tensor(c2, c_, 3, 3))
+
+        self.bn1 = nn.BatchNorm2d(c_)
+        self.bn2 = nn.BatchNorm2d(c2)
+
+        self.act = nn.SiLU()
+
+        nn.init.kaiming_uniform_(self.share_weightconv1, nonlinearity="relu")
+        nn.init.kaiming_uniform_(self.share_weightconv2, nonlinearity="relu")
+
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(c2))
+        else:
+            self.bias = None
+
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0)
+
+    def forward_for_small(self, x):
+        residual = x
+        out = nn.functional.conv2d(x, self.share_weightconv1, bias=self.bias)
+        out = self.bn1(out)
+        out = self.act(out)
+
+        out = nn.functional.conv2d(out, self.share_weightconv2, bias=self.bias, stride=self.stride, padding=self.padding[0],
+                                   dilation=self.dilate[0])
+        out = self.bn2(out)
+        out += residual
+        out = self.act(out)
+
+        return out
+
+    def forward_for_middle(self, x):
+        residual = x
+        out = nn.functional.conv2d(x, self.share_weightconv1, bias=self.bias)
+        out = self.bn1(out)
+        out = self.act(out)
+
+        out = nn.functional.conv2d(out, self.share_weightconv2, bias=self.bias, stride=self.stride, padding=self.padding[1],
+                                   dilation=self.dilate[1])
+        out = self.bn2(out)
+        out += residual
+        out = self.act(out)
+
+        return out
+
+    def forward_for_big(self, x):
+        residual = x
+        out = nn.functional.conv2d(x, self.share_weightconv1, bias=self.bias)
+        out = self.bn1(out)
+        out = self.act(out)
+
+        out = nn.functional.conv2d(out, self.share_weightconv2, bias=self.bias, stride=self.stride, padding=self.padding[2],
+                                   dilation=self.dilate[2])
+        out = self.bn2(out)
+        out += residual
+        out = self.act(out)
+
+        return out
+
+    def forward(self, x):
+        xm = x
+        base_feat = []
+        if self.c is not False:
+            x1 = self.forward_for_small(x)
+            x2 = self.forward_for_middle(x)
+            x3 = self.forward_for_big(x)
+        else:
+            x1 = self.forward_for_small(xm[0])
+            x2 = self.forward_for_middle(xm[1])
+            x3 = self.forward_for_big(xm[2])
+
+        base_feat.append(x1)
+        base_feat.append(x2)
+        base_feat.append(x3)
+
+        return base_feat
+
+class RFEM(nn.Module):
+    def __init__(self, c1, c2, n=1, e=0.5, stride=1):
+        super(RFEM, self).__init__()
+        c = True
+        layers = []
+        layers.append(TridentBlock(c1, c2, stride=stride, c=c, e=e))
+        c1 = c2
+        for i in range(1, n):
+            layers.append(TridentBlock(c1, c2))
+        self.layer = nn.Sequential(*layers)
+        # self.cv = Conv(c2, c2)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        out = self.layer(x)
+        out = out[0] + out[1] + out[2] + x
+        out = self.act(self.bn(out))
+        return out
+
+class C3RFEM(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        # self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        # self.rfem = RFEM(c_, c_, n)
+        self.m = nn.Sequential(*[RFEM(c_, c_, n=1, e=e) for _ in range(n)])
+        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+
+    
+

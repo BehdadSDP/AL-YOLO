@@ -509,7 +509,7 @@ def train(hyp, opt, device, callbacks):
     torch.cuda.empty_cache()
     return results
 
-
+#
 def parse_opt(known=False):
     """Parses command-line arguments for YOLOv5 training, validation, and testing."""
     parser = argparse.ArgumentParser()
